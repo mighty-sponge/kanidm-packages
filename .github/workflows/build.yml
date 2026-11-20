@@ -1,0 +1,99 @@
+name: build
+
+on:
+  push:
+    tags:
+      - "v*-*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "upstream kanidm version (tag without v)"
+        required: true
+        default: "1.10.5"
+      release:
+        description: "package release"
+        required: true
+        default: "1"
+
+permissions:
+  contents: write
+
+jobs:
+  rpm:
+    runs-on: ubuntu-latest
+    container: almalinux:9
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Version
+        id: v
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          IN_VERSION: ${{ inputs.version }}
+          IN_RELEASE: ${{ inputs.release }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            tag="${REF_NAME#v}"
+            ver="${tag%-*}"
+            rel="${tag##*-}"
+          else
+            ver="$IN_VERSION"
+            rel="$IN_RELEASE"
+          fi
+          echo "version=$ver" >> "$GITHUB_OUTPUT"
+          echo "release=$rel" >> "$GITHUB_OUTPUT"
+          echo "building kanidm $ver-$rel"
+
+      - name: Build dependencies
+        env:
+          VER: ${{ steps.v.outputs.version }}
+          REL: ${{ steps.v.outputs.release }}
+        run: |
+          dnf -y install dnf-plugins-core rpm-build git
+          dnf config-manager --set-enabled crb
+          dnf -y builddep kanidm.spec --define "pkgver $VER" --define "pkgrel $REL"
+          rustc --version
+
+      - name: Source
+        env:
+          VER: ${{ steps.v.outputs.version }}
+        run: |
+          mkdir -p ~/rpmbuild/SOURCES
+          curl -fsSL -o ~/rpmbuild/SOURCES/kanidm-$VER.tar.gz \
+            https://github.com/kanidm/kanidm/archive/refs/tags/v$VER.tar.gz
+
+      - name: Cargo cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ steps.v.outputs.version }}
+
+      - name: Build RPMs
+        env:
+          VER: ${{ steps.v.outputs.version }}
+          REL: ${{ steps.v.outputs.release }}
+        run: rpmbuild -bb kanidm.spec --define "pkgver $VER" --define "pkgrel $REL"
+
+      - name: Show packages
+        run: |
+          for f in ~/rpmbuild/RPMS/x86_64/*.rpm; do
+            echo "=== $(basename $f)"
+            rpm -qp --requires "$f" | grep -v '^rpmlib' | sed 's/^/requires: /'
+            rpm -qlp "$f" | grep -v '^/usr/share/kanidm/ui/hpkg/'
+          done
+          mkdir -p dist && cp ~/rpmbuild/RPMS/x86_64/*.rpm dist/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kanidm-${{ steps.v.outputs.version }}-${{ steps.v.outputs.release }}-el9
+          path: dist/*.rpm
+
+      - name: Release
+        if: github.ref_type == 'tag'
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*.rpm
