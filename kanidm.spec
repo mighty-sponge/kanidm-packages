@@ -163,4 +163,4 @@ cp -r server/core/static %{buildroot}%{_datadir}/kanidm/ui/hpkg
 
 %changelog
 * Fri Nov 20 2026 Kirill Shklyaev - 1.10.5-1
-- EL9 build from the upstream v1.10.5 tag, spec trimmed from openSUSE OBS network:idm/kanidm
+- EL9 build from upstream tags, spec trimmed from openSUSE OBS network:idm/kanidm

@@ -9,7 +9,7 @@ on:
       version:
         description: "upstream kanidm version (tag without v)"
         required: true
-        default: "1.10.5"
+        default: "1.12.1"
       release:
         description: "package release"
         required: true
@@ -18,14 +18,18 @@ on:
 permissions:
   contents: write
 
-jobs:
-  rpm:
-    runs-on: ubuntu-latest
-    container: almalinux:9
-    timeout-minutes: 120
-    steps:
-      - uses: actions/checkout@v7
+env:
+  # kanidm/kanidm_ppa_automation: upstream deb packaging scripts, pinned
+  PPA_AUTOMATION_REF: 0d99aac13cb1cabb37e7ab847e9e1358aaadcfd6
+  DEB_TARGET: x86_64-unknown-linux-gnu
 
+jobs:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+      release: ${{ steps.v.outputs.release }}
+    steps:
       - name: Version
         id: v
         env:
@@ -46,10 +50,18 @@ jobs:
           echo "release=$rel" >> "$GITHUB_OUTPUT"
           echo "building kanidm $ver-$rel"
 
+  rpm:
+    needs: version
+    runs-on: ubuntu-latest
+    container: almalinux:9
+    timeout-minutes: 120
+    env:
+      VER: ${{ needs.version.outputs.version }}
+      REL: ${{ needs.version.outputs.release }}
+    steps:
+      - uses: actions/checkout@v7
+
       - name: Build dependencies
-        env:
-          VER: ${{ steps.v.outputs.version }}
-          REL: ${{ steps.v.outputs.release }}
         run: |
           dnf -y install dnf-plugins-core rpm-build git
           dnf config-manager --set-enabled crb
@@ -57,8 +69,6 @@ jobs:
           rustc --version
 
       - name: Source
-        env:
-          VER: ${{ steps.v.outputs.version }}
         run: |
           mkdir -p ~/rpmbuild/SOURCES
           curl -fsSL -o ~/rpmbuild/SOURCES/kanidm-$VER.tar.gz \
@@ -70,12 +80,9 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-          key: cargo-${{ steps.v.outputs.version }}
+          key: cargo-el9-${{ env.VER }}
 
       - name: Build RPMs
-        env:
-          VER: ${{ steps.v.outputs.version }}
-          REL: ${{ steps.v.outputs.release }}
         run: rpmbuild -bb kanidm.spec --define "pkgver $VER" --define "pkgrel $REL"
 
       - name: Show packages
@@ -89,11 +96,110 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: kanidm-${{ steps.v.outputs.version }}-${{ steps.v.outputs.release }}-el9
+          name: kanidm-${{ env.VER }}-${{ env.REL }}-el9
           path: dist/*.rpm
 
+  deb:
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - codename: noble
+            image: ubuntu:24.04
+          - codename: trixie
+            image: debian:13
+    runs-on: ubuntu-latest
+    container: ${{ matrix.os.image }}
+    timeout-minutes: 120
+    env:
+      VER: ${{ needs.version.outputs.version }}
+      REL: ${{ needs.version.outputs.release }}
+      CODENAME: ${{ matrix.os.codename }}
+    steps:
+      # git must exist before checkout, otherwise checkout falls back to the REST API without .git
+      - name: Get git
+        run: apt-get update && apt-get install -y git ca-certificates curl
+
+      - name: Checkout Kanidm
+        uses: actions/checkout@v7
+        with:
+          repository: kanidm/kanidm
+          ref: v${{ env.VER }}
+          submodules: false
+
+      - name: Checkout packaging scripts
+        uses: actions/checkout@v7
+        with:
+          repository: kanidm/kanidm_ppa_automation
+          ref: ${{ env.PPA_AUTOMATION_REF }}
+          path: platform/debian/kanidm_ppa_automation
+
+      - name: Build dependencies
+        run: platform/debian/kanidm_ppa_automation/scripts/install_ci_build_dependencies.sh
+
+      # distro rust is too old: install the version from Cargo.toml (build_native.sh pins it too)
+      - name: Rust
+        run: |
+          rust_version="$(awk -F '"' '/^rust-version/ {print $2}' Cargo.toml)"
+          curl --proto '=https' --tlsv1.2 --retry 10 --retry-all-errors -fsSL https://sh.rustup.rs \
+            | sh -s -- --default-toolchain "$rust_version" --profile minimal -y
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Cargo cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ matrix.os.codename }}-${{ env.VER }}
+
+      - name: Build binaries
+        run: platform/debian/kanidm_ppa_automation/scripts/build_native.sh "$DEB_TARGET"
+
+      - name: Strip binaries
+        run: |
+          find "target/$DEB_TARGET/release" -maxdepth 1 -not -name "*.d" -name "kanidm*" \
+            | xargs llvm-strip --strip-all
+
+      # upstream derives the deb version from the commit date; use <version>-<release>~<codename> instead
+      - name: Build debs
+        run: |
+          script=platform/debian/kanidm_ppa_automation/scripts/build_debs.sh
+          sed -i -E 's|^PACKAGE_VERSION=.*|PACKAGE_VERSION="${VER}-${REL}~${CODENAME}"|' "$script"
+          grep -q '^PACKAGE_VERSION="${VER}-${REL}~${CODENAME}"$' "$script"
+          "$script" "$DEB_TARGET"
+
+      # GitHub mangles "~" in asset names: rename files, the version inside stays <ver>-<rel>~<codename>
+      - name: Show packages
+        run: |
+          mkdir -p dist
+          for f in target/"$DEB_TARGET"/debian/*.deb; do
+            pkg="$(dpkg-deb -f "$f" Package)"
+            arch="$(dpkg-deb -f "$f" Architecture)"
+            echo "=== $pkg $(dpkg-deb -f "$f" Version) $arch"
+            dpkg-deb -f "$f" Depends | sed 's/^/depends: /'
+            dpkg-deb -c "$f" | awk '{print $6}' | grep -v '^./usr/share/kanidmd/static/.' || true
+            cp "$f" "dist/${pkg}_${VER}-${REL}.${CODENAME}_${arch}.deb"
+          done
+          ls -l dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: kanidm-${{ env.VER }}-${{ env.REL }}-${{ matrix.os.codename }}
+          path: dist/*.deb
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: [rpm, deb]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
       - name: Release
-        if: github.ref_type == 'tag'
         uses: softprops/action-gh-release@v3
         with:
-          files: dist/*.rpm
+          files: dist/*
